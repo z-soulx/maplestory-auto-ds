@@ -22,6 +22,8 @@ import cv2
 import numpy as np
 
 from src.utils.logger import logger
+from src.utils.latency import LatencyMonitor, milliseconds
+from src.utils.player_identity import SOURCES, identity_selection, migrate_legacy_identity
 from src.utils.common import (
     load_yaml, load_image, get_mask, find_pattern_sqdiff,
     nms, draw_rectangle, screenshot, to_opencv_hsv,
@@ -43,7 +45,7 @@ class MonsterDetector:
         # Frames are processed automatically in the main loop
     """
 
-    def __init__(self, cfg: dict, test_image: str = ""):
+    def __init__(self, cfg: dict, test_image: str = "", recorder=None):
         """
         Initialize the monster detector.
 
@@ -51,12 +53,20 @@ class MonsterDetector:
             cfg: Configuration dictionary.
             test_image: Path to a test image for offline debugging.
         """
+        if migrate_legacy_identity(cfg):
+            logger.info("[Config] 旧版定位设置已兼容为互补模式；名字被挡时可使用已勾选的勋章或外观。")
         self.cfg = cfg
         self.test_image = test_image
+        self.recorder = recorder
+        self.latency = LatencyMonitor()
+        self._capture_metadata = {}
+        self._previous_capture_sequence = None
+        self._previous_analysis_start = None
 
         # Monster data
         self.monsters_info: dict = {}   # {name: [(img, mask), ...]}
         self.monster_cfg: dict = {}     # {name: {diff_thres, scales, ...}}
+        self._scaled_monster_templates = {}
         self.monsters: list = []        # Detected monsters in current frame
 
         # Frame data
@@ -77,6 +87,12 @@ class MonsterDetector:
         self._pending_title_select_loc = None
         self._title_lock_miss_count = 0
         self._title_fixed = False       # F12 toggles: freeze the title box (and player pos)
+        self._identity_valid = False
+        self._identity_reason = "not_checked"
+        self._identity_scores = {}
+        self._identity_search_center = None
+        self._identity_used_sources = []
+        self._identity_last_log_time = 0.0
 
         # Minimap
         self.loc_minimap = (0, 0)
@@ -120,6 +136,7 @@ class MonsterDetector:
         self._hunt_search_last_progress_x = None
         self._hunt_search_stall_frames = 0
         self._hunt_search_last_reason = "idle"
+        self._last_hunt_log_state = None
 
         # In-place attack "walk about" state machine (prevents attack lockout)
         self._in_place_state = "attack"       # "attack" | "pre_walk" | "walk_away" | "walk_back"
@@ -127,17 +144,35 @@ class MonsterDetector:
         self._in_place_walk_dir = "left"      # fallback direction when no facing
         self._in_place_backward_dir = "left"  # backward dir (opposite of facing)
         self._in_place_start_x = None         # minimap X at walk-about start (for return-to-start)
-        self._in_place_no_monster_frames = 0  # consecutive frames without a monster (for idle AoE)
 
         # Load title template for player detection
         self.img_title = None
         self.img_title_gray = None
-        if os.path.exists("character/title.png"):
-            self.img_title = load_image("character/title.png")
-            self.img_title_gray = load_image("character/title.png", cv2.IMREAD_GRAYSCALE)
+        title_path = self.cfg.get("title", {}).get("template", "character/title.png")
+        if os.path.exists(title_path):
+            self.img_title = load_image(title_path)
+            self.img_title_gray = load_image(title_path, cv2.IMREAD_GRAYSCALE)
             logger.info(f"  Loaded title template: {self.img_title.shape[1]}x{self.img_title.shape[0]}")
         else:
-            logger.warning("  No character/title.png found, player will stay at frame center")
+            logger.warning(f"  No title template at {title_path}, player will stay at frame center")
+
+        self._identity_templates = []
+        for item in self.cfg.get("player_identity", {}).get("templates", []):
+            path = item["template"]
+            if os.path.isfile(path):
+                self._identity_templates.append((load_image(path), item))
+            else:
+                logger.warning(f"  Missing player name template: {path}")
+        identity_sources, identity_policy = identity_selection(self.cfg)
+        logger.info(
+            f"[Policy] search_attack={self.cfg.get('directional_attack', {}).get('search_attack_while_move', False)} "
+            f"attack_range=({self.cfg.get('directional_attack', {}).get('attack_range_x', 100)},"
+            f"{self.cfg.get('directional_attack', {}).get('attack_range_y', 35)}) "
+            f"player_identity={self.cfg.get('player_identity', {}).get('enable', False)} "
+            f"medal_check={'medal' in identity_sources} "
+            f"appearance_check={'appearance' in identity_sources}"
+            f" sources={identity_sources} policy={identity_policy}"
+        )
 
         # Load character appearance template (unique anchor used to disambiguate
         # the shared 称号 when it is lost or collides with other players).
@@ -219,6 +254,7 @@ class MonsterDetector:
         #   - list: [name, ...]                        (all use global defaults)
         specified = self.cfg["monster_detect"].get("monsters", [])
         self.monster_cfg = {}
+        self._scaled_monster_templates.clear()
         if isinstance(specified, dict):
             monster_names = list(specified.keys())
             for name, m_cfg in specified.items():
@@ -332,7 +368,7 @@ class MonsterDetector:
         if self.capture is None:
             self.start_capture()
 
-        frame = self.capture.get_frame()
+        frame, self._capture_metadata = self.capture.get_frame_with_metadata()
         if frame is None:
             return None
 
@@ -384,6 +420,20 @@ class MonsterDetector:
         if x1 <= x0 or y1 <= y0:
             return []
 
+        # The requested region describes where targets may be, not a crop that
+        # must contain their entire sprite. Long monsters can straddle its edge.
+        search_bounds = (x0, y0, x1, y1)
+        pad_x = pad_y = 0
+        for name, images in self.monsters_info.items():
+            scales = self.monster_cfg.get(name, {}).get(
+                "scales", self.cfg["monster_detect"].get("scales", [1.0]))
+            scale = max(scales)
+            for template, _ in images:
+                h, w = template.shape[:2]
+                pad_x, pad_y = max(pad_x, int(w * scale)), max(pad_y, int(h * scale))
+        x0, y0 = max(0, x0 - pad_x), max(0, y0 - pad_y)
+        x1 = min(self.img_frame.shape[1], x1 + pad_x)
+        y1 = min(self.img_frame.shape[0], y1 + pad_y)
         img_roi = self.img_frame[y0:y1, x0:x1]
 
         # Shift player location into ROI coordinate system
@@ -410,6 +460,7 @@ class MonsterDetector:
             )
         elif mode in ("color", "grayscale", "contour_only"):
             roi_h, roi_w = img_roi.shape[:2]
+            color_spread = self._color_spread_image(img_roi)
 
             for monster_name, monster_imgs in self.monsters_info.items():
                 for img_monster, mask_monster in monster_imgs:
@@ -421,7 +472,8 @@ class MonsterDetector:
                         img_roi,
                         img_monster, mask_monster,
                         x0, y0, monster_name, mode,
-                        char_x_min, char_y_min, char_x_max, char_y_max
+                        char_x_min, char_y_min, char_x_max, char_y_max,
+                        color_spread=color_spread
                     )
                     monsters.extend(found)
         else:
@@ -436,7 +488,10 @@ class MonsterDetector:
             hp_bar_monsters = self._detect_by_hp_bar(img_roi, x0, y0)
             monsters.extend(hp_bar_monsters)
 
-        return monsters
+        left, top, right, bottom = search_bounds
+        return [m for m in monsters
+                if m["position"][0] < right and m["position"][0] + m["size"][1] > left
+                and m["position"][1] < bottom and m["position"][1] + m["size"][0] > top]
 
     @staticmethod
     def _color_spread(patch: np.ndarray, mask: np.ndarray) -> float:
@@ -451,10 +506,30 @@ class MonsterDetector:
         sel = mask > 0
         if not np.any(sel):
             return 0.0
-        px = patch[sel].astype(int)
+        px = patch[sel]
         b, g, r = px[:, 0], px[:, 1], px[:, 2]
         spread = np.maximum(np.maximum(r, g), b) - np.minimum(np.minimum(r, g), b)
         return float(spread.mean())
+
+    @staticmethod
+    def _color_spread_image(image):
+        b, g, r = cv2.split(image)
+        high, low = cv2.max(cv2.max(b, g), r), cv2.min(cv2.min(b, g), r)
+        return cv2.subtract(high, low).astype(np.float32)
+
+    def _scaled_monster_template(self, image, mask, scale):
+        """Keep immutable scaled sprites across frames, including their owners."""
+        key = (id(image), id(mask), float(scale))
+        cached = self._scaled_monster_templates.get(key)
+        if cached is None:
+            h, w = image.shape[:2]
+            size = (max(8, int(w * scale)), max(8, int(h * scale)))
+            scaled = cv2.resize(image, size, interpolation=cv2.INTER_NEAREST) if scale != 1 else image
+            scaled_mask = (cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST)
+                           if mask is not None and scale != 1 else mask)
+            cached = (image, mask, scaled, scaled_mask)
+            self._scaled_monster_templates[key] = cached
+        return cached[2:]
 
     def _match_template(
         self,
@@ -465,7 +540,8 @@ class MonsterDetector:
         monster_name: str,
         mode: str,
         char_x_min: int, char_y_min: int,
-        char_x_max: int, char_y_max: int
+        char_x_max: int, char_y_max: int,
+        color_spread=None
     ) -> list:
         """
         Match a single monster template against an ROI.
@@ -477,22 +553,12 @@ class MonsterDetector:
             diff_thres = float(m_cfg.get("diff_thres", self.cfg["monster_detect"]["diff_thres"]))
         except (TypeError, ValueError):
             diff_thres = float(self.cfg["monster_detect"].get("diff_thres", 0.3))
-        h, w = img_monster.shape[:2]
-
         # Multi-scale matching (per-monster scales override the global default)
         scales = m_cfg.get("scales", self.cfg["monster_detect"].get("scales", [1.0]))
 
         for scale in scales:
-            if scale == 1.0:
-                tmpl, msk, th, tw = img_monster, mask_monster, h, w
-            else:
-                tw = max(8, int(w * scale))
-                th = max(8, int(h * scale))
-                tmpl = cv2.resize(img_monster, (tw, th), interpolation=cv2.INTER_NEAREST)
-                if mask_monster is not None:
-                    msk = cv2.resize(mask_monster, (tw, th), interpolation=cv2.INTER_NEAREST)
-                else:
-                    msk = None
+            tmpl, msk = self._scaled_monster_template(img_monster, mask_monster, scale)
+            th, tw = tmpl.shape[:2]
 
             try:
                 if mode == "contour_only":
@@ -513,8 +579,11 @@ class MonsterDetector:
                     else:
                         res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_SQDIFF_NORMED)
                 elif mode == "color":
-                    if msk is not None:
-                        res = cv2.matchTemplate(img_roi, tmpl, cv2.TM_SQDIFF_NORMED, mask=msk)
+                    if (msk is not None and diff_thres <= 0.35
+                            and img_roi.shape[0] * img_roi.shape[1] > 150000):
+                        res = self._match_color_coarse_to_fine(img_roi, tmpl, msk, diff_thres)
+                    elif msk is not None:
+                        res = self._match_masked_color(img_roi, tmpl, msk)
                     else:
                         res = cv2.matchTemplate(img_roi, tmpl, cv2.TM_SQDIFF_NORMED)
                 else:
@@ -527,31 +596,86 @@ class MonsterDetector:
             if min_val < self.best_score:
                 self.best_score = min_val
 
-            # Collect matches below threshold
-            match_locations = np.where(res <= diff_thres)
+            # Keep every valid offset until global NMS has compared all poses.
+            # Per-pose truncation/suppression can lose a partly covered monster
+            # when a different pose later replaces the box that suppressed it.
+            valid = np.isfinite(res) & (res <= diff_thres)
             min_spread = float(m_cfg.get(
                 "min_color_spread",
                 self.cfg["monster_detect"].get("min_color_spread", 30)
             ))
-            count = 0
-            for pt in zip(*match_locations[::-1]):
-                if count >= 50:
-                    break
-                # Color guard: reject neutral gray/white patches (clouds, sky)
-                # by requiring enough color spread over the monster's pixels.
-                if msk is not None and min_spread > 0:
-                    patch = img_roi[pt[1]:pt[1] + th, pt[0]:pt[0] + tw]
-                    if self._color_spread(patch, msk) < min_spread:
-                        continue
+            if np.any(valid) and msk is not None and min_spread > 0:
+                # One correlation computes the same masked mean color spread
+                # for all offsets, instead of slicing hundreds of duplicate boxes.
+                spread = (color_spread if color_spread is not None else
+                          self._color_spread_image(img_roi))
+                weights = (msk > 0).astype(np.float32)
+                count = float(np.sum(weights))
+                if count == 0:
+                    continue
+                spread_scores = cv2.matchTemplate(spread, weights, cv2.TM_CCORR) / count
+                valid &= spread_scores >= min_spread
+            ys, xs = np.where(valid)
+            for y, x in zip(ys.tolist(), xs.tolist()):
                 monsters.append({
                     "name": monster_name,
-                    "position": (pt[0] + x0, pt[1] + y0),
+                    "position": (x + x0, y + y0),
                     "size": (th, tw),
-                    "score": res[pt[1], pt[0]],
+                    "score": float(res[y, x]),
                 })
-                count += 1
 
         return monsters
+
+    @staticmethod
+    def _match_masked_color(image, template, mask, prepared=None):
+        """Binary-mask SQDIFF_NORMED using two unmasked correlations.
+
+        Combine the three image energy channels before correlation; OpenCV's
+        masked implementation correlates these channels separately. All masks
+        loaded by this detector are binary, so this preserves the score formula.
+        """
+        pixels = image.astype(np.float32)
+        if prepared is None:
+            weights = (mask > 0).astype(np.float32)
+            pattern = template.astype(np.float32) * weights[:, :, None]
+            pattern_energy = float(np.sum(pattern * pattern))
+        else:
+            weights, pattern, pattern_energy = prepared
+        energy = cv2.transform(pixels * pixels, np.ones((1, 3), np.float32))
+        image_energy = cv2.matchTemplate(energy, weights, cv2.TM_CCORR)
+        cross = cv2.matchTemplate(pixels, pattern, cv2.TM_CCORR)
+        denominator = np.sqrt(np.maximum(image_energy * pattern_energy, 0))
+        numerator = np.maximum(image_energy + pattern_energy - 2 * cross, 0)
+        return np.divide(numerator, denominator, out=np.ones_like(cross), where=denominator > 1e-6)
+
+    @staticmethod
+    def _match_color_coarse_to_fine(image, template, mask, threshold):
+        """Find candidates at half size, then verify their original color pixels."""
+        h, w = template.shape[:2]
+        ih, iw = image.shape[:2]
+        small_image = cv2.resize(image, (iw // 2, ih // 2), interpolation=cv2.INTER_AREA)
+        small_template = cv2.resize(template, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+        small_mask = cv2.resize(mask, (w // 2, h // 2), interpolation=cv2.INTER_NEAREST)
+        coarse = MonsterDetector._match_masked_color(small_image, small_template, small_mask)
+        coarse = np.nan_to_num(coarse, nan=1.0, posinf=1.0, neginf=1.0)
+        # Keep a generous proposal threshold. The normal full-size threshold and
+        # color guard still decide whether any candidate is a real monster.
+        minima = (coarse <= cv2.erode(coarse, np.ones((7, 7), np.uint8))) & (coarse <= max(0.35, threshold * 1.5))
+        ys, xs = np.where(minima)
+        order = np.argsort(coarse[ys, xs])[:24]
+        result = np.full((ih - h + 1, iw - w + 1), 1.0, dtype=np.float32)
+        weights = (mask > 0).astype(np.float32)
+        pattern = template.astype(np.float32) * weights[:, :, None]
+        prepared = (weights, pattern, float(np.sum(pattern * pattern)))
+        for index in order:
+            x, y = int(xs[index] * 2), int(ys[index] * 2)
+            x0, y0 = max(0, x - 4), max(0, y - 4)
+            x1, y1 = min(iw - w + 1, x + 5), min(ih - h + 1, y + 5)
+            fine = MonsterDetector._match_masked_color(
+                image[y0:y1 + h - 1, x0:x1 + w - 1], template, mask, prepared)
+            fine = np.nan_to_num(fine, nan=1.0, posinf=1.0, neginf=1.0)
+            result[y0:y1, x0:x1] = np.minimum(result[y0:y1, x0:x1], fine)
+        return result
 
     def _detect_template_free(
         self,
@@ -688,6 +812,16 @@ class MonsterDetector:
             (x0, y0), (y1 - y0, x1 - x0),
             (255, 255, 0), "Search", thickness=2, text_height=0.5
         )
+
+    def _draw_attack_region(self):
+        cfg = self.cfg.get("directional_attack", {})
+        rx, ry = int(cfg.get("attack_range_x", 100)), int(cfg.get("attack_range_y", 35))
+        px, py = self.loc_player
+        x0, y0 = max(0, px - rx), max(0, py - ry)
+        x1 = min(self.img_frame.shape[1] - 1, px + rx)
+        y1 = min(self.img_frame.shape[0] - 1, py + ry)
+        draw_rectangle(self.img_frame_debug, (x0, y0), (y1 - y0, x1 - x0),
+                       (0, 215, 255), "Skill", thickness=1, text_height=0.5)
 
     def _fallback_player_location(self):
         """Keep last valid player position, or fall back to frame center."""
@@ -828,15 +962,20 @@ class MonsterDetector:
                 f"[Appearance] Using appearance at {feet} (score={score:.2f})"
             )
 
-    def _collect_title_candidates(self, img_roi, img_pat, max_candidates: int, score_threshold: float):
+    def _collect_title_candidates(self, img_roi, img_pat, max_candidates: int, score_threshold: float,
+                                  score_sink=None, method=cv2.TM_SQDIFF_NORMED, mask=None):
         """Collect multiple non-overlapping title candidates from a full-frame template match."""
         h_img, w_img = img_roi.shape[:2]
         h_pat, w_pat = img_pat.shape[:2]
         if h_pat > h_img or w_pat > w_img:
             return []
 
-        result = cv2.matchTemplate(img_roi, img_pat, cv2.TM_SQDIFF_NORMED)
+        result = cv2.matchTemplate(img_roi, img_pat, method, mask=mask)
+        if method == cv2.TM_CCORR_NORMED:
+            result = 1.0 - result
         result = np.nan_to_num(result, nan=1.0, posinf=1.0, neginf=1.0)
+        if score_sink is not None:
+            score_sink["best"] = float(cv2.minMaxLoc(result)[0])
         work = result.copy()
         suppress_x = max(12, w_pat // 2)
         suppress_y = max(8, h_pat // 2)
@@ -947,6 +1086,12 @@ class MonsterDetector:
             )
 
         status = f"TitleSel: {'LOCKED' if locked else 'AUTO'} | LClick select | RClick/C clear | miss={miss_count}"
+        identity = self.cfg.get("player_identity", {})
+        if identity.get("enable"):
+            state = "VERIFIED" if self._identity_valid else "LOST"
+            checks, policy = identity_selection(self.cfg)
+            used = "+".join(self._identity_used_sources) or "none"
+            status = f"Player: {identity.get('name', '')} | {state} | {policy} {'+'.join(checks)} | using {used}"
         cv2.putText(
             self.img_frame_debug,
             status,
@@ -958,8 +1103,214 @@ class MonsterDetector:
             cv2.LINE_AA,
         )
 
+    def _detect_player_by_identity(self):
+        """Locate using explicit independent sources, or the legacy name checks."""
+        self._identity_valid = False
+        self._identity_reason = "name_mismatch"
+        self._identity_scores = {}
+        self._identity_used_sources = []
+        self.title_sim = None
+        self.loc_title = None
+        self.loc_player = (0, 0)
+        self._update_title_candidates_snapshot([], (1, 1))
+        identity = self.cfg["player_identity"]
+        if "sources" in identity:
+            self._detect_selected_identity()
+            return
+        if not self._identity_templates:
+            self._identity_reason = "missing_name_template"
+            return
+        # Search near the last verified name first. This is only a search hint:
+        # every returned position must match the name in the current frame.
+        for region, origin_x, origin_y in self._identity_search_regions():
+            best = self._match_identity_region(region, origin_x, origin_y)
+            if best is not None:
+                break
+        if best is None:
+            return
+        _, score, self.loc_player, candidate, size = best
+        self._identity_search_center = self.loc_player
+        self._identity_valid = True
+        self._identity_reason = "verified"
+        self._identity_used_sources = identity_selection(self.cfg)[0]
+        self.loc_title = candidate["loc"]
+        self._title_last_seen_frame = self.frame_count
+        self.title_sim = 1.0 - score
+        self._update_title_candidates_snapshot([candidate], size)
+
+    def _identity_search_regions(self):
+        center = self._identity_search_center
+        if center is not None:
+            px, py = center
+            x0, y0 = max(0, px - 220), max(0, py - 220)
+            x1 = min(self.img_frame.shape[1], px + 220)
+            y1 = min(self.img_frame.shape[0], py + 220)
+            yield self.img_frame[y0:y1, x0:x1], x0, y0
+        yield self.img_frame, 0, 0
+
+    def _identity_source_candidates(self, source, region, origin_x, origin_y):
+        identity = self.cfg["player_identity"]
+        patterns = []
+        if source == "name":
+            for template, options in self._identity_templates:
+                if options.get("partial", False) and not identity.get("allow_partial_name", True):
+                    continue
+                label = "partial" if options.get("partial", False) else "full"
+                patterns.append((template, None, options["offset"],
+                                 float(options.get("diff_thres", 0.04)), label, cv2.TM_SQDIFF_NORMED))
+        elif source == "medal" and self.img_title_gray is not None:
+            region = cv2.GaussianBlur(cv2.cvtColor(region, cv2.COLOR_BGR2GRAY), (3, 3), 0)
+            template = cv2.GaussianBlur(self.img_title_gray, (3, 3), 0)
+            patterns.append((template, None, self.cfg["title"].get("offset", (0, -60)),
+                             float(identity.get("medal_threshold", 0.06)), "medal", cv2.TM_SQDIFF_NORMED))
+        elif source == "appearance" and self.img_appearance is not None:
+            cfg = self.cfg.get("appearance", {})
+            h, _ = self.img_appearance.shape[:2]
+            ox, oy = cfg.get("feet_offset", (0, -6))
+            for flip in (False, True):
+                template = cv2.flip(self.img_appearance, 1) if flip else self.img_appearance
+                mask = self.img_appearance_mask
+                if flip and mask is not None:
+                    mask = cv2.flip(mask, 1)
+                patterns.append((template, mask, (ox, h - h // 2 + oy),
+                                 1.0 - float(cfg.get("match_threshold", 0.85)),
+                                 "appearance_flip" if flip else "appearance", cv2.TM_CCORR_NORMED))
+        found = []
+        for template, mask, offset, threshold, label, method in patterns:
+            h, w = template.shape[:2]
+            scores = {}
+            candidates = self._collect_title_candidates(region, template, 12, threshold, scores, method, mask)
+            self._identity_scores[label] = f"{scores.get('best', 1.0):.3f}/{threshold:.3f}"
+            for candidate in candidates:
+                x, y = candidate["loc"]
+                x, y = x + origin_x, y + origin_y
+                candidate.update(loc=(x, y), box=(x, y, w, h))
+                feet = (x + w // 2 + offset[0], y + h // 2 + offset[1])
+                found.append((candidate["score"] / max(threshold, 1e-6),
+                              candidate["score"], feet, candidate, (w, h)))
+        return sorted(found, key=lambda candidate: candidate[0])
+
+    def _detect_selected_identity(self):
+        identity = self.cfg["player_identity"]
+        selected = identity.get("sources", [])
+        policy = identity.get("match_policy", "any")
+        self._identity_reason = "sources_mismatch"
+        if (not isinstance(selected, (list, tuple)) or not selected
+                or any(source not in SOURCES for source in selected) or policy not in ("any", "all")):
+            self._identity_reason = "invalid_sources"
+            return
+        sources = [source for source in SOURCES if source in selected]
+        tolerance = int(identity.get("alignment_tolerance", 8))
+        for region, origin_x, origin_y in self._identity_search_regions():
+            matches = {}
+            best = None
+            used = []
+            for source in sources:
+                matches[source] = self._identity_source_candidates(source, region, origin_x, origin_y)
+                if policy == "any" and matches[source]:
+                    best, used = matches[source][0], [source]
+                    break
+            if policy == "all" and all(matches[source] for source in sources):
+                # Confirm that all selected features describe the same character.
+                for anchor in matches[sources[0]]:
+                    px, py = anchor[2]
+                    if all(any(abs(candidate[2][0] - px) <= tolerance
+                               and abs(candidate[2][1] - py) <= tolerance
+                               for candidate in matches[source]) for source in sources[1:]):
+                        best, used = anchor, sources
+                        break
+            if best is None:
+                continue
+            _, score, self.loc_player, candidate, size = best
+            self._identity_search_center = self.loc_player
+            self._identity_valid = True
+            self._identity_reason = "verified"
+            self._identity_used_sources = used
+            self.loc_title = candidate["loc"]
+            self._title_last_seen_frame = self.frame_count
+            self.title_sim = 1.0 - score
+            self._update_title_candidates_snapshot([candidate], size)
+            return
+
+    def _match_identity_region(self, region, origin_x, origin_y):
+        identity = self.cfg["player_identity"]
+        best = None
+        for template, options in self._identity_templates:
+            if options.get("partial", False) and not identity.get("allow_partial_name", True):
+                continue
+            h, w = template.shape[:2]
+            dx, dy = options["offset"]
+            threshold = float(options.get("diff_thres", 0.04))
+            scores = {}
+            candidates = self._collect_title_candidates(region, template, 12, threshold, scores)
+            label = options.get("label", "partial" if options.get("partial", False) else "full")
+            self._identity_scores[label] = f"{scores.get('best', 1.0):.3f}/{threshold:.3f}"
+            for candidate in candidates:
+                nx, ny = candidate["loc"]
+                nx, ny = nx + origin_x, ny + origin_y
+                candidate.update(loc=(nx, ny), box=(nx, ny, w, h))
+                feet = (nx + w // 2 + dx, ny + h // 2 + dy)
+                if not self._identity_auxiliary_matches(feet):
+                    continue
+                score = candidate["score"]
+                if best is None or score / threshold < best[0]:
+                    best = (score / threshold, score, feet, candidate, (w, h))
+        return best
+
+    def _identity_auxiliary_matches(self, feet):
+        """Optional checks confirm the name's position and never replace it."""
+        identity = self.cfg["player_identity"]
+        radius = int(identity.get("alignment_tolerance", 8))
+
+        def roi_at(image, shape, anchor):
+            h, w = shape[:2]
+            x, y = feet[0] - anchor[0], feet[1] - anchor[1]
+            x0, y0 = max(0, x - radius), max(0, y - radius)
+            x1 = min(image.shape[1], x + w + radius)
+            y1 = min(image.shape[0], y + h + radius)
+            return image[y0:y1, x0:x1] if x1 - x0 >= w and y1 - y0 >= h else None
+
+        if identity.get("require_medal", False):
+            self._identity_reason = "medal_mismatch"
+            if self.img_title_gray is None:
+                return False
+            h, w = self.img_title_gray.shape[:2]
+            ox, oy = self.cfg.get("title", {}).get("offset", (0, -89))
+            roi = roi_at(self.img_frame_gray, (h, w), (w // 2 + ox, h // 2 + oy))
+            if roi is None:
+                return False
+            result = cv2.matchTemplate(cv2.GaussianBlur(roi, (3, 3), 0),
+                                       cv2.GaussianBlur(self.img_title_gray, (3, 3), 0),
+                                       cv2.TM_SQDIFF_NORMED)
+            if cv2.minMaxLoc(result)[0] > float(identity.get("medal_threshold", 0.06)):
+                return False
+        if identity.get("require_appearance", False):
+            self._identity_reason = "appearance_mismatch"
+            if self.img_appearance is None:
+                return False
+            h, w = self.img_appearance.shape[:2]
+            cfg = self.cfg.get("appearance", {})
+            ox, oy = cfg.get("feet_offset", (0, -6))
+            roi = roi_at(self.img_frame, (h, w), (w // 2 + ox, h + oy))
+            if roi is None:
+                return False
+            scores = []
+            for flip in (False, True):
+                template = cv2.flip(self.img_appearance, 1) if flip else self.img_appearance
+                mask = self.img_appearance_mask
+                mask = cv2.flip(mask, 1) if flip and mask is not None else mask
+                result = cv2.matchTemplate(roi, template, cv2.TM_CCORR_NORMED, mask=mask)
+                result = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+                scores.append(cv2.minMaxLoc(result)[1])
+            if max(scores) < float(cfg.get("match_threshold", 0.85)):
+                return False
+        return True
+
     def _detect_player_by_title(self):
         """Detect player location by matching the title template (at character feet)."""
+        if self.cfg.get("player_identity", {}).get("enable", False):
+            self._detect_player_by_identity()
+            return
         if self._title_fixed:
             # Frozen: keep the current title box / player position, skip detection.
             return
@@ -1670,14 +2021,28 @@ class MonsterDetector:
             thickness=3, text_height=1.0,
         )
 
-    def _get_attack_facing(self) -> str:
+    def _monster_distance(self, monster):
+        """Horizontal edge distance and difference between the two feet positions."""
+        px, py = self.loc_player
+        mx, my = monster["position"]
+        mh, mw = monster["size"]
+        return max(mx - px, px - (mx + mw), 0), abs(my + mh - py)
+
+    def _get_monsters_in_attack_range(self):
+        cfg = self.cfg.get("directional_attack", {})
+        rx, ry = float(cfg.get("attack_range_x", 100)), float(cfg.get("attack_range_y", 35))
+        return [m for m in self.monsters
+                if self._monster_distance(m)[0] <= rx and self._monster_distance(m)[1] <= ry]
+
+    def _get_attack_facing(self, monsters=None) -> str:
         """Return left/right facing toward the nearest detected monster."""
-        if not self.monsters:
+        monsters = self.monsters if monsters is None else monsters
+        if not monsters:
             return "none"
 
         px, _ = self.loc_player
         nearest_dx = None
-        for m in self.monsters:
+        for m in monsters:
             mx, _ = m.get("position", (0, 0))
             mh, mw = m.get("size", (0, 0))
             cx = mx + (mw // 2)
@@ -1791,7 +2156,7 @@ class MonsterDetector:
             self._hunt_search_last_reason = "pause"
             return "none", "none", "none"
 
-        action = "attack" if bool(cfg.get("search_attack_while_move", True)) else "none"
+        action = "attack" if bool(cfg.get("search_attack_while_move", False)) else "none"
 
         # Random jump during search (looks more human-like)
         jump_chance = float(cfg.get("search_random_jump_chance", 0.0))
@@ -1835,6 +2200,7 @@ class MonsterDetector:
         Returns (move_x, move_y, action).
         """
         cfg = self.cfg.get("directional_attack", {})
+        attack_targets = self._get_monsters_in_attack_range()
         fps = max(1.0, float(self.cfg.get("system", {}).get("fps_limit_main", 15)))
         interval = max(1, int(float(cfg.get("in_place_walk_interval_seconds", 2.0)) * fps))
         walk_frames = max(1, int(float(cfg.get("in_place_walk_seconds", 0.5)) * fps))
@@ -1889,7 +2255,7 @@ class MonsterDetector:
         elif self._in_place_state == "mid_pause":
             # On the first frame of the mid pause, fire a single attack once
             # (attempt to break attack lockout after moving right).
-            if self._in_place_state_frame == 1:
+            if self._in_place_state_frame == 1 and attack_targets:
                 return "none", "none", "attack_once"
             return "none", "none", "none"
         elif self._in_place_state == "walk_back":
@@ -1899,27 +2265,16 @@ class MonsterDetector:
         # "attack" / "pre_walk" / "post_walk": stand still, no movement.
         # Attack only during "attack" state (not during pre/post_walk pause).
         if self._in_place_state == "attack":
-            if self.monsters:
-                self._in_place_no_monster_frames = 0
+            if attack_targets:
                 aoe_threshold = int(
                     self.cfg.get("directional_attack", {}).get("aoe_monster_count", 3)
                 )
-                action = "aoe" if len(self.monsters) >= aoe_threshold else "attack"
+                action = "aoe" if len(attack_targets) >= aoe_threshold else "attack"
                 # Turn to face the nearest monster before attacking.
-                facing = self._get_attack_facing()
+                facing = self._get_attack_facing(attack_targets)
                 if facing in ("left", "right"):
                     return f"face_{facing}", "none", action
                 return "none", "none", action
-            # No monster detected: after a configurable idle time, fire AoE once
-            # as a scout shot (does not move, so it never conflicts with walk-about).
-            self._in_place_no_monster_frames += 1
-            aoe_idle_seconds = float(
-                self.cfg.get("directional_attack", {}).get("in_place_aoe_idle_seconds", 5.0)
-            )
-            aoe_idle_frames = max(1, int(aoe_idle_seconds * fps))
-            if self._in_place_no_monster_frames >= aoe_idle_frames:
-                self._in_place_no_monster_frames = 0
-                return "none", "none", "aoe"  # one-shot scout shot
             return "none", "none", "none"
         return "none", "none", "none"
 
@@ -1978,6 +2333,9 @@ class MonsterDetector:
         mode_text = f"Bot: {bot_mode.upper()} [F11]"
         fix_text = f"Box: {'FIXED' if self._title_fixed else 'FOLLOW'} [F12]"
         fix_color = (0, 0, 255) if self._title_fixed else (0, 255, 0)
+        if self.cfg.get("player_identity", {}).get("enable", False):
+            fix_text = "Box: NAME FOLLOW"
+            fix_color = (0, 255, 0)
 
         for i, (text, color) in enumerate([(mode_text, mode_color), (fix_text, fix_color)]):
             (mw, mh), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
@@ -2094,10 +2452,38 @@ class MonsterDetector:
         self.is_frame_done = False
 
         # Capture frame
+        analysis_cycle_start = time.perf_counter()
+        self._capture_metadata = {}
         self.img_frame = self.get_img_frame()
+        frame_read_done = time.perf_counter()
+        capture_meta = self._capture_metadata
+        timings = {"get_frame_ms": milliseconds(analysis_cycle_start, frame_read_done),
+                   "cycle_interval_ms": (milliseconds(self._previous_analysis_start, analysis_cycle_start)
+                                         if self._previous_analysis_start is not None else None)}
+        self._previous_analysis_start = analysis_cycle_start
+        capture_start = capture_meta.get("capture_start_monotonic")
+        capture_end = capture_meta.get("capture_end_monotonic")
+        sequence = capture_meta.get("sequence")
+        if capture_end is not None:
+            timings.update(capture_ms=capture_meta.get("capture_ms"),
+                           capture_interval_ms=capture_meta.get("capture_interval_ms"),
+                           frame_wait_ms=milliseconds(capture_end, capture_meta["read_monotonic"]))
+        capture_meta["reused_frame"] = (sequence == self._previous_capture_sequence
+                                         if capture_end is not None else None)
+        capture_meta["skipped_frames"] = (max(0, sequence - self._previous_capture_sequence - 1)
+                                          if capture_end is not None and self._previous_capture_sequence is not None else None)
+        self._previous_capture_sequence = sequence
+        capture_ms = self.recorder.elapsed_ms() if self.recorder else None
         if self.img_frame is None:
             logger.warning("Failed to capture game frame. Waiting...")
-            if is_windows():
+            self.monsters = []
+            self._identity_valid = False
+            if self._kb:
+                self._kb.set_command("none none none")
+            if self.recorder:
+                self.recorder.event("capture_failed", frame=self.frame_count,
+                                    command="none none none", timings_ms=timings, capture=capture_meta)
+            if is_windows() and self.capture:
                 activate_game_window(self.capture.window_title)
             return -1
 
@@ -2206,12 +2592,29 @@ class MonsterDetector:
             route_action = self.cmd_action
 
         # Detect player via title template matching
+        identity_start = time.perf_counter()
+        timings["preprocess_ms"] = milliseconds(frame_read_done, identity_start)
+        identity_was_valid = self._identity_valid
+        identity_previous_sources = tuple(self._identity_used_sources)
         self._detect_player_by_title()
 
         # Refine with character appearance (handles title loss / same-title conflicts)
-        if self.cfg.get("appearance", {}).get("enable", False):
+        identity_enabled = self.cfg.get("player_identity", {}).get("enable", False)
+        if self.cfg.get("appearance", {}).get("enable", False) and not identity_enabled:
             self._apply_appearance_anchor()
+        player_located = not identity_enabled or self._identity_valid
+        if identity_enabled:
+            now_identity = time.perf_counter()
+            if (identity_was_valid != self._identity_valid
+                    or identity_previous_sources != tuple(self._identity_used_sources)
+                    or (not player_located and now_identity - self._identity_last_log_time >= 5.0)):
+                logger.info(f"[Identity] state={self._identity_reason} feet={self.loc_player} "
+                            f"name_diff/limit={self._identity_scores} "
+                            f"using={'+'.join(self._identity_used_sources) or 'none'} "
+                            f"policy={identity_selection(self.cfg)[1]}")
+                self._identity_last_log_time = now_identity
 
+        timings["identity_ms"] = milliseconds(identity_start)
         # Compute search region (same formula for detection & display)
         margin = self.cfg["monster_detect"].get("search_box_margin", 50)
         if self.cfg["bot"]["attack"] == "aoe_skill":
@@ -2233,10 +2636,19 @@ class MonsterDetector:
         # ---------------------------------------------------------------
         # Monster detection — frame skipping for performance
         # ---------------------------------------------------------------
-        interval = self.cfg["monster_detect"].get("detection_interval", 2)
-        if self.frame_count % interval == 0:
+        monster_start = time.perf_counter()
+        had_monsters = bool(self.monsters)
+        # Hunting decisions must use the same frame as the player position.
+        # Reusing old monster boxes after walking/knockback changes distances.
+        interval = (1 if self.cfg.get("bot", {}).get("mode") == "hunt"
+                    else max(1, int(self.cfg["monster_detect"].get("detection_interval", 2))))
+        detection_updated = False
+        if not player_located:
+            self.monsters = []
+        elif self.frame_count % interval == 0 or (identity_enabled and not identity_was_valid):
             # Detect monsters on this frame
             self.monsters = self.get_monsters_in_range((x0, y0), (x1, y1))
+            detection_updated = True
 
             if self.monsters:
                 names = set(m["name"] for m in self.monsters)
@@ -2244,8 +2656,13 @@ class MonsterDetector:
                     f"Detected {len(self.monsters)} monsters: {names}"
                 )
 
+        monster_done = time.perf_counter()
+        timings["monster_ms"] = milliseconds(monster_start, monster_done)
+        attack_targets = self._get_monsters_in_attack_range()
         # Dispatch movement/action command after detection so attack can react this frame.
         if self._kb:
+            max_dy = float(self.cfg.get("directional_attack", {}).get("attack_range_y", 35))
+            same_level = [m for m in self.monsters if self._monster_distance(m)[1] <= max_dy]
             move_x, move_y = "none", "none"
             action = "none"
             route_move_x, route_move_y = "none", "none"
@@ -2264,24 +2681,24 @@ class MonsterDetector:
             follow_route = bool(
                 self.cfg["bot"].get("enable_route") and self.img_route is not None
             )
+            searching = False
 
             if mode == "hunt" and attack_in_place and not follow_route:
                 # 原地攻击 + 定期左右走动（防攻击失效）——仅在不跟路线时
                 self._reset_hunt_search_state()
                 move_x, move_y, action = self._get_in_place_command()
-            elif mode == "hunt" and self.monsters:
+            elif mode == "hunt" and attack_targets:
                 self._reset_hunt_search_state()
                 # AoE when monster count >= threshold, else single-target attack.
                 aoe_threshold = int(
                     self.cfg.get("directional_attack", {}).get("aoe_monster_count", 3)
                 )
-                action = "aoe" if len(self.monsters) >= aoe_threshold else "attack"
+                action = "aoe" if len(attack_targets) >= aoe_threshold else "attack"
                 if attack_style == "directional":
-                    facing = self._get_attack_facing()
+                    facing = self._get_attack_facing(attack_targets)
                     if facing in ("left", "right"):
-                        # 按住方向键朝怪物走（走动能可靠地让角色面向怪物），
-                        # 而不是轻点转身（轻点有时被攻击动画吞掉，导致打反方向）。
-                        move_x = facing
+                        # In skill range: turn toward the target without walking past it.
+                        move_x = f"face_{facing}"
                         if not self.is_on_ladder:
                             move_y = "none"
                     elif route_move_x in ("left", "right") and self.is_on_ladder:
@@ -2290,10 +2707,24 @@ class MonsterDetector:
                         # 怪物已在攻击范围内（deadzone 内）：停下攻击，不跟路线漂。
                         if not self.is_on_ladder:
                             move_x = "none"
+            elif mode == "hunt" and same_level:
+                self._reset_hunt_search_state()
+                # Approach a reachable platform first; other floors are not melee targets.
+                if same_level and not self.is_on_ladder:
+                    move_x = self._get_attack_facing(same_level)
+                    move_y, action = "none", "none"
             elif mode == "hunt" and not follow_route:
                 # 没路线时才左右搜索找怪
                 self._hunt_no_monster_frames += 1
+                if had_monsters and player_located:
+                    # Resume the chase immediately after a target disappears;
+                    # the cold-start search delay otherwise stops each pursuit.
+                    cfg_attack = self.cfg.get("directional_attack", {})
+                    self._hunt_no_monster_frames = max(
+                        self._hunt_no_monster_frames, int(cfg_attack.get("search_trigger_frames", 4)))
+                    self._hunt_search_dir = self._last_walk_dir
                 if attack_style == "directional":
+                    searching = True
                     search_x, search_y, search_action = self._get_hunt_search_command()
                     if search_x != "none" or search_y != "none" or search_action != "none":
                         move_x, move_y, action = search_x, search_y, search_action
@@ -2308,7 +2739,11 @@ class MonsterDetector:
             # 跟路线用全局坐标；无路线(找怪)用小地图坐标判断是否卡住。
             now = time.time()
             scfg = self.cfg.get("stuck_recovery", {})
-            if scfg.get("enable", True):
+            if attack_targets or not player_located:
+                # Recovery cannot override a newly reachable target, or outlive lost identity.
+                self._unstick_until = 0.0
+                self._stuck_last_move_time = now
+            if scfg.get("enable", True) and player_located and mode == "hunt" and not attack_targets:
                 if follow_route:
                     cur_pos = self.loc_player_global
                 elif self.loc_player_minimap is not None:
@@ -2335,13 +2770,6 @@ class MonsterDetector:
             if time.time() < self._unstick_until:
                 move_x, move_y, action = self._unstick_dir, "none", "none"
 
-            if mode == "hunt" and self.frame_count % 30 == 0:
-                logger.info(
-                    f"[Hunt] monsters={len(self.monsters)} inPlace={attack_in_place} "
-                    f"dispatch=({move_x},{move_y},{action}) on_ladder={self.is_on_ladder} "
-                    f"search=(noMob:{self._hunt_no_monster_frames},dir:{self._hunt_search_dir})"
-                )
-
             # 宽度边界：任何移动模式下，绿点都不许超出黄色虚线（左右边界）。
             boundary_pct = float(self.cfg.get("minimap", {}).get("width_boundary_pct", 0.0))
             if (0.0 < boundary_pct < 1.0
@@ -2362,12 +2790,76 @@ class MonsterDetector:
                         if not self.is_on_ladder:
                             move_y = "none"
 
-            self._kb.set_command(f"{move_x} {move_y} {action}")
+            # Route/stuck recovery must never move the player in detect mode.
+            if mode != "hunt" or not player_located:
+                move_x, move_y, action = "none", "none", "none"
+                self._unstick_until = 0.0
+            allow_search_attack = (mode == "hunt" and player_located and searching
+                                   and bool(self.cfg.get("directional_attack", {}).get("search_attack_while_move", False))
+                                   and action == "attack")
+            # An explicit search option is the only exception to skill range checks.
+            if not attack_targets and action in ("attack", "aoe", "attack_once") and not allow_search_attack:
+                action = "none"
+            reason = ("detect" if mode != "hunt" else "player_lost" if not player_located
+                      else "search_attack_enabled" if allow_search_attack
+                      else "no_target" if not self.monsters
+                      else "out_of_range" if not attack_targets else "target")
+            input_state = ("paused" if getattr(self._kb, "is_enable", True) is False
+                           else "background" if getattr(self._kb, "_had_focus", True) is False else "ready")
+            nearest = min((tuple(round(float(v), 1) for v in self._monster_distance(m))
+                           for m in self.monsters), default=None)
+            command = f"{move_x} {move_y} {action}"
+            decision_ready = time.perf_counter()
+            timings.update(decision_ms=milliseconds(monster_done, decision_ready),
+                           analysis_ms=milliseconds(frame_read_done, decision_ready),
+                           frame_age_at_decision_ms=(milliseconds(capture_end, decision_ready)
+                                                     if capture_end is not None else None),
+                           frame_to_decision_ms=(milliseconds(capture_start, decision_ready)
+                                                 if capture_start is not None else None))
+            latency_log = self.latency.observe(timings)
+            if latency_log:
+                logger.info(latency_log)
+            dispatch_start = time.perf_counter()
+            decision_id = None
+            if self.recorder:
+                decision_id = self.recorder.decision(
+                    self.img_frame, frame=self.frame_count, capture_elapsed_ms=capture_ms,
+                    mode=mode, player=self.loc_player, player_valid=player_located,
+                    timings_ms=timings, capture=capture_meta,
+                    identity_reason=self._identity_reason, identity_scores=self._identity_scores,
+                    identity_sources=self._identity_used_sources,
+                    identity_policy=identity_selection(self.cfg)[1],
+                    minimap_player=self.loc_player_minimap, search_box=(x0, y0, x1, y1),
+                    detection_updated=detection_updated, monsters=self.monsters,
+                    attack_targets=attack_targets, nearest_dx_dy=nearest,
+                    command=command, reason=reason, input_state=input_state,
+                    searching=searching, unstick=time.time() < self._unstick_until)
+                self._kb.set_command(command, decision_id=decision_id,
+                                     timing_origin={"capture_start_monotonic": capture_start,
+                                                    "capture_end_monotonic": capture_end,
+                                                    "decision_ready_monotonic": decision_ready})
+            else:
+                self._kb.set_command(command)
+            dispatch_done = time.perf_counter()
+            log_state = (mode, len(self.monsters), len(attack_targets), move_x, move_y, action, reason, input_state)
+            if mode == "hunt" and (log_state != self._last_hunt_log_state or self.frame_count % 30 == 0):
+                logger.info(
+                    f"[Hunt] monsters={len(self.monsters)} inRange={len(attack_targets)} inPlace={attack_in_place} "
+                    f"dispatch=({move_x},{move_y},{action}) reason={reason} "
+                    f"input={input_state} nearest_dx_dy={nearest} "
+                    f"search=(noMob:{self._hunt_no_monster_frames},dir:{self._hunt_search_dir})"
+                )
+            self._last_hunt_log_state = log_state
 
         # Always draw decorations on debug frame
         if self.is_show_debug:
             self._update_debug_overlay()        # Text first (bottom layer)
-            self._draw_search_region(x0, y0, x1, y1)  # Search border
+            if player_located:
+                self._draw_search_region(x0, y0, x1, y1)  # Search border
+                self._draw_attack_region()
+            else:
+                cv2.putText(self.img_frame_debug, "PLAYER LOST - movement / attack paused",
+                            (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             # Draw minimap rectangle (matches reference project)
             if self.img_minimap is not None:
                 draw_rectangle(
@@ -2448,7 +2940,12 @@ class MonsterDetector:
                         cv2.rectangle(self.img_frame_debug, (px_paste, py_paste),
                                       (px_paste + cw, py_paste + ch), (255, 255, 255), 2)
 
-            self._draw_player_marker()          # Player dot
+            if player_located:
+                self._draw_player_marker()          # Player dot
+                if identity_enabled:
+                    cv2.putText(self.img_frame_debug, f"PLAYER {self.cfg['player_identity'].get('name', '')}",
+                                (max(0, self.loc_player[0] - 70), max(25, self.loc_player[1] - 35)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             self._draw_minimap_selection()      # Manual minimap drag-select box
             self._draw_minimap_magnifier()      # Zoomed cursor view (select mode)
             for monster in self.monsters:       # Monster boxes (top layer)
@@ -2481,6 +2978,11 @@ class MonsterDetector:
             # Signal a new renderable frame for the UI thread.
             self.frame_seq += 1
 
+        if self.recorder and self._kb:
+            self.recorder.event("frame_complete", decision_id=decision_id, frame=self.frame_count,
+                                timings_ms={"record_and_dispatch_ms": milliseconds(dispatch_start, dispatch_done),
+                                            "post_dispatch_ms": milliseconds(dispatch_done),
+                                            "cycle_work_ms": milliseconds(analysis_cycle_start)})
         self.is_frame_done = True
         return 0
 
@@ -2494,6 +2996,10 @@ class MonsterDetector:
 
     def toggle_title_fixed(self):
         """Toggle whether the title/player box is frozen at its current position."""
+        if self.cfg.get("player_identity", {}).get("enable", False):
+            self._title_fixed = False
+            logger.info("[Player] Name verification stays active; position cannot be frozen.")
+            return False
         self._title_fixed = not self._title_fixed
         logger.info(f"[Title] Box {'FROZEN' if self._title_fixed else 'FOLLOWING'}")
         return self._title_fixed
@@ -2531,6 +3037,14 @@ class MonsterDetector:
             try:
                 self.run_once()
             except Exception as e:
+                self.monsters = []
+                self._identity_valid = False
+                if self._kb:
+                    self._kb.set_command("none none none")
+                if self.recorder:
+                    self.recorder.event("processing_error", frame=self.frame_count,
+                                        error=str(e), traceback=traceback.format_exc(),
+                                        command="none none none")
                 logger.error(f"[MonsterDetector] Frame processing error: {e}")
                 logger.error(traceback.format_exc())
                 continue

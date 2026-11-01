@@ -209,6 +209,26 @@ def nms(monsters: list, iou_threshold: float = 0.3) -> list:
     if not monsters:
         return []
 
+    # Compare crowded candidate sets in arrays, preserving the exact greedy
+    # order and IoU boundary used below without Python comparisons per box.
+    if len(monsters) > 100:
+        boxes = np.asarray([[m["position"][0], m["position"][1],
+                             m["position"][0] + m["size"][1],
+                             m["position"][1] + m["size"][0]] for m in monsters], dtype=np.float64)
+        areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        order = np.argsort([m["score"] for m in monsters], kind="stable")
+        keep = []
+        while order.size:
+            best, rest = int(order[0]), order[1:]
+            keep.append(monsters[best])
+            intersection = np.maximum(0, np.minimum(boxes[best, 2:], boxes[rest, 2:])
+                                      - np.maximum(boxes[best, :2], boxes[rest, :2]))
+            intersection = intersection[:, 0] * intersection[:, 1]
+            union = areas[best] + areas[rest] - intersection
+            iou = np.divide(intersection, union, out=np.zeros_like(intersection), where=union > 0)
+            order = rest[iou < iou_threshold]
+        return keep
+
     # Sort by score ascending (lower SQDIFF score = better match)
     sorted_monsters = sorted(monsters, key=lambda m: m["score"])
     keep = []
@@ -364,29 +384,40 @@ if is_windows():
             logger.warning(f"[activate_game_window] Failed: {e}")
 
 
-    def get_game_window_title_by_token(token: str) -> str:
+    def get_game_window_title_by_token(token: str, exact_match: bool = False) -> str:
         """
-        Enumerate all windows and return the title of the first window
-        whose title contains the given token (case-insensitive).
+        Prefer a full title match; accept a partial match only if unique.
 
         Args:
             token: Substring to search for in window titles.
+            exact_match: Require the complete title; never select a related webpage.
 
         Returns:
             The full window title, or empty string if not found.
         """
-        result = ""
+        if not token.strip():
+            return ""
+        candidates = []
 
         def callback(hwnd, _):
-            nonlocal result
             if win32gui.IsWindowVisible(hwnd):
                 title = win32gui.GetWindowText(hwnd)
-                if token.lower() in title.lower():
-                    result = title
+                if token.casefold() in title.casefold():
+                    candidates.append(title)
             return True
 
         win32gui.EnumWindows(callback, None)
-        return result
+        exact = [title for title in candidates if title.casefold() == token.casefold()]
+        if exact:
+            return exact[0]
+        if exact_match:
+            return ""
+        candidates = list(dict.fromkeys(candidates))
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            logger.error(f"Ambiguous game window title {token!r}: {candidates}. Use the full title.")
+        return ""
 
 
     def resize_window(window_title: str, width: int = 1296, height: int = 759):
@@ -413,7 +444,7 @@ else:
         logger.warning("[activate_game_window] Not implemented on this platform")
 
 
-    def get_game_window_title_by_token(token: str) -> str:
+    def get_game_window_title_by_token(token: str, exact_match: bool = False) -> str:
         logger.warning("[get_game_window_title_by_token] Not implemented on this platform")
         return ""
 

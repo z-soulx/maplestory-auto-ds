@@ -1,6 +1,14 @@
 # ============================================================================
 # MapleStory Auto Detection — 默认配置
 # ============================================================================
+
+# 检测＋攻击指令诊断录制；与 detect / hunt 模式独立，默认关闭。
+recording:
+  enable: false
+  directory: "recordings"
+  fps: 5                  # 原始画面最高采样率；每轮检测决策和实际攻击发送均记录
+  max_seconds: 600
+  max_mb: 512
 # 游戏窗口: "MapleStoryGo"
 # 自定义覆盖请写到 config/config_custom.yaml
 # ============================================================================
@@ -91,13 +99,17 @@ monster_detect:
 # 方向攻击设置
 # ---------------------------------------------------------------------------
 directional_attack:
-  range_x: 600           # 水平攻击范围（像素）
-  range_y: 70            # 垂直攻击范围（像素）
+  range_x: 600           # 水平搜索范围（像素），技能距离另见 attack_range_x
+  range_y: 70            # 垂直搜索范围（像素），技能高低差另见 attack_range_y
   cooldown: 0.9          # 攻击冷却时间（秒）
+  face_tap_duration: 0.05    # 转身按住方向键的时间（秒）
+  turn_settle_seconds: 0.08 # 松开转身键后等待游戏响应（秒）
   search_enabled: true   # hunt模式且没怪时，是否左右移动找怪
   search_trigger_frames: 4   # 连续多少帧没怪后开始左右搜索
   search_flip_frames: 18      # 每多少帧切换一次左右方向
-  search_attack_while_move: true # 搜索移动中是否继续按攻击键
+  search_attack_while_move: false # 界面可勾选；仅找怪移动时允许无目标空挥
+  attack_range_x: 100      # 角色脚下到怪物水平边缘的有效距离，独立于搜索框
+  attack_range_y: 35       # 怪物脚下与角色脚下允许的高低差
   search_stall_frames: 8       # 连续多少帧几乎没水平位移，视为顶墙/卡住
   search_stall_min_delta_px: 1.0 # 最小水平位移阈值（优先使用小地图坐标）
   search_max_offset_px: 45     # 单边最多离开搜索起点多远，超出就反向；0=不限制

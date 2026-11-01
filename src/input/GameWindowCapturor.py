@@ -28,6 +28,10 @@ class GameWindowCapturor:
         self.frame = None
         self.lock = threading.Lock()
         self.is_terminated = False
+        self._first_frame = threading.Event()
+        self._capture_error = None
+        self._capture_failures = 0
+        self.frame_metadata = {"source": "offline" if test_image_path else "live", "sequence": 0}
 
         if test_image_path:
             # Offline test mode: load a static image
@@ -42,14 +46,19 @@ class GameWindowCapturor:
         import win32gui
         self._win32gui = win32gui
 
-        self.window_title = get_game_window_title_by_token(cfg["game_window"]["title"])
+        self.window_title = get_game_window_title_by_token(
+            cfg["game_window"]["title"],
+            exact_match=cfg["game_window"].get("exact_match", False),
+        )
         if not self.window_title:
             logger.error(
                 f"[GameWindowCapturor] Unable to find window containing "
                 f"'{cfg['game_window']['title']}'"
             )
-            self.frame = None
-            return
+            raise RuntimeError(
+                f"Game window not found: {cfg['game_window']['title']!r}. "
+                "Set game_window.title to part of the actual window title."
+            )
 
         logger.info(f"[GameWindowCapturor] Found window: '{self.window_title}'")
 
@@ -57,26 +66,36 @@ class GameWindowCapturor:
         self.fps_limit = cfg["system"]["fps_limit_window_capturor"]
         self.t_last_run = 0.0
 
-        # Use mss to capture the screen region
-        self.capture = mss.mss()
+        # mss owns thread-local native resources; create it in the capture thread.
+        self.capture = None
 
         # Get initial window region
         self.update_window_region()
 
         # Start capture in daemon thread (matches macOS reference exactly)
-        threading.Thread(target=self.start_capture, daemon=True).start()
+        self._thread = threading.Thread(target=self.start_capture, daemon=True)
+        self._thread.start()
 
-        # Busy-wait for first frame (matches macOS reference exactly)
-        time.sleep(0.1)
-        while self.frame is None:
-            self.limit_fps()
+        if not self._first_frame.wait(timeout=10.0) or self.frame is None:
+            self.stop()
+            raise RuntimeError(
+                f"No game frame received within 10 seconds: {self._capture_error or self.window_title}"
+            )
 
     def start_capture(self):
         """Capture loop — runs in daemon thread."""
-        while not self.is_terminated:
-            self.update_window_region()
-            self.capture_frame()
-            self.limit_fps()
+        try:
+            with mss.mss() as capture:
+                self.capture = capture
+                while not self.is_terminated:
+                    self.update_window_region()
+                    self.capture_frame()
+                    self.limit_fps()
+        except Exception as exc:
+            self._capture_error = exc
+            logger.error(f"[GameWindowCapturor] Capture failed: {exc}")
+        finally:
+            self._first_frame.set()
 
     def stop(self):
         """Stop the capture thread."""
@@ -110,11 +129,25 @@ class GameWindowCapturor:
             return
 
         try:
+            capture_start = time.perf_counter()
             img = self.capture.grab(self.region)
             frame = np.array(img)
+            capture_end = time.perf_counter()
             with self.lock:
+                previous_end = self.frame_metadata.get("capture_end_monotonic")
+                self.frame_metadata = {
+                    "source": "live", "sequence": self.frame_metadata["sequence"] + 1,
+                    "capture_start_monotonic": capture_start,
+                    "capture_end_monotonic": capture_end,
+                    "capture_ms": (capture_end - capture_start) * 1000,
+                    "capture_interval_ms": ((capture_end - previous_end) * 1000
+                                            if previous_end is not None else None),
+                }
                 self.frame = frame
+            self._first_frame.set()
         except Exception as e:
+            self._capture_error = e
+            self._capture_failures += 1
             logger.debug(f"[GameWindowCapturor] grab error: {e}")
 
     def get_frame(self):
@@ -124,12 +157,18 @@ class GameWindowCapturor:
         Returns:
             BGR numpy array, or None if no frame is available.
         """
-        with self.lock:
-            if self.frame is None:
-                return None
-            # Only grab reference inside lock — convert outside
-            frame_ref = self.frame
+        return self.get_frame_with_metadata()[0]
 
+    def get_frame_with_metadata(self):
+        """Return an image and the timestamps of that exact frame atomically."""
+        with self.lock:
+            frame_ref = self.frame
+            metadata = dict(self.frame_metadata)
+            metadata["capture_failures"] = self._capture_failures
+            metadata["read_monotonic"] = time.perf_counter()
+        return self._convert_frame(frame_ref), metadata
+
+    def _convert_frame(self, frame_ref):
         if frame_ref is None or getattr(frame_ref, "size", 0) == 0:
             return None
         if len(frame_ref.shape) < 3 or frame_ref.shape[0] <= 0 or frame_ref.shape[1] <= 0:

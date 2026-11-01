@@ -1,0 +1,53 @@
+{
+  "name_cn": "风独眼兽",
+  "name": "Curse Eye",
+  "id": 3230100,
+  "region": "GMS",
+  "version": "83",
+  "wiki": "https://maplestory.wiki/GMS/83/mob/3230100",
+  "api": "https://maplestory.io/api/GMS/83/mob/3230100",
+  "framebooks": {
+    "die1": 3,
+    "hit1": 1,
+    "jump": 1,
+    "move": 4,
+    "stand": 3
+  },
+  "frames": [
+    {
+      "file": "stand_0.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/3230100/render/stand/0",
+      "sha256": "b134570c9e140cde896388b4612e70575e33ae5a03cc9fe98bc0964a6c2cdec1"
+    },
+    {
+      "file": "stand_1.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/3230100/render/stand/1",
+      "sha256": "4d3eed73f44ce2c0fba3229fe545b56f131a41c65f196a37c1bdca780cf0e602"
+    },
+    {
+      "file": "stand_2.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/3230100/render/stand/2",
+      "sha256": "a501f77a189710045c1eabc5190afa61ecfe32ae5de70a498a701c0ad5555d59"
+    },
+    {
+      "file": "move_0.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/3230100/render/move/0",
+      "sha256": "56adf9682d55c518104e0973fbd860a146c90a68f2350d201059e28df075c22e"
+    },
+    {
+      "file": "move_1.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/3230100/render/move/1",
+      "sha256": "d5fb4bcbb176c13828b0d9eec27726a249cad0847204b37c2e883ad241022fc7"
+    },
+    {
+      "file": "move_2.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/3230100/render/move/2",
+      "sha256": "1529e549963610123dca457e1b8451396f3c51944b9d5164ae4c138851ba8274"
+    },
+    {
+      "file": "move_3.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/3230100/render/move/3",
+      "sha256": "bbf0083e217b4cfd15b49103314cda6afbe16e201117f6b70410a807b6ec81b5"
+    }
+  ]
+}

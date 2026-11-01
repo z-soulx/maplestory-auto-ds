@@ -10,6 +10,8 @@ build/
 # Virtual environment
 venv/
 .venv/
+config/config_local.yaml
+config/config_local.yaml.tmp
 env/
 
 # IDE
@@ -19,6 +21,7 @@ env/
 log/
 screenshot/
 video/
+recordings/
 
 # OS files
 .DS_Store

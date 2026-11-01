@@ -1,12 +1,12 @@
 # MapleStory Auto Detection — Dependencies
-# Python 3.8+
+# Python 3.10+ (recommended: 3.12)
 
 # Computer vision
 opencv-python>=4.5.0
 numpy>=1.20.0
 
-# Screen capture (Windows)
-windows-capture
+# Screen capture (the current capturer uses mss)
+mss>=9.0.0
 
 # YAML configuration
 pyyaml>=5.4
@@ -17,6 +17,9 @@ pynput>=1.7.0
 
 # Windows API (already installed with pywin32 typically)
 pywin32>=300
+
+# Warning sound playback
+pygame>=2.5.0
 
 # Data validation (optional, for future use)
 # pydantic>=2.0

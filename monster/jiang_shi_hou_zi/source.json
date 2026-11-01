@@ -1,0 +1,44 @@
+{
+  "name_cn": "无魂猴子／僵尸猴子",
+  "name": "Zombie Lupin",
+  "id": 4230101,
+  "region": "GMS",
+  "version": "83",
+  "wiki": "https://maplestory.wiki/GMS/83/mob/4230101",
+  "api": "https://maplestory.io/api/GMS/83/mob/4230101",
+  "framebooks": {
+    "attack1": 11,
+    "die1": 3,
+    "hit1": 1,
+    "jump": 1,
+    "move": 4,
+    "stand": 1
+  },
+  "frames": [
+    {
+      "file": "stand_0.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/4230101/render/stand/0",
+      "sha256": "f6e5b6f5940991398f9d49f9e844abb1a5f329163e6b0dac133f1793e828bbb0"
+    },
+    {
+      "file": "move_0.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/4230101/render/move/0",
+      "sha256": "eb133f5aa960e6fc7e37bdc4ab39cea51209d890d37be3a2ac1f16a80ddfdcf2"
+    },
+    {
+      "file": "move_1.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/4230101/render/move/1",
+      "sha256": "ac50f53fd4f708372312152c4a1dd30fef1239b5787216bd9913a34629672ca9"
+    },
+    {
+      "file": "move_2.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/4230101/render/move/2",
+      "sha256": "f39f43d6bd395560a75b03931ad1782f7282d17a636e7edf18cbfbe85afbbe13"
+    },
+    {
+      "file": "move_3.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/4230101/render/move/3",
+      "sha256": "b0ea0745edc40fdd07309e15d3e22323dcd11d4393631eddc651a9a31a964844"
+    }
+  ]
+}

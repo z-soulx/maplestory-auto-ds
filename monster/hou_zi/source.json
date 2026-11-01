@@ -1,0 +1,44 @@
+{
+  "name_cn": "猴子",
+  "name": "Lupin",
+  "id": 3210800,
+  "region": "GMS",
+  "version": "83",
+  "wiki": "https://maplestory.wiki/GMS/83/mob/3210800",
+  "api": "https://maplestory.io/api/GMS/83/mob/3210800",
+  "framebooks": {
+    "attack1": 11,
+    "die1": 3,
+    "hit1": 1,
+    "jump": 1,
+    "move": 4,
+    "stand": 1
+  },
+  "frames": [
+    {
+      "file": "stand_0.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/3210800/render/stand/0",
+      "sha256": "3286de4e6d8b44d9fc9d3a4d1cc004a28ac8ecb266c752e45b1bb8bd7e8ab4de"
+    },
+    {
+      "file": "move_0.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/3210800/render/move/0",
+      "sha256": "41031f677233ab5e5f7e515c5bbc59cc042e92886613c9a457814d2724ab7a4c"
+    },
+    {
+      "file": "move_1.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/3210800/render/move/1",
+      "sha256": "ec24375b1382a1363be0f366409d3f62516b7b40269ed707fa297509a277fc2e"
+    },
+    {
+      "file": "move_2.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/3210800/render/move/2",
+      "sha256": "3f4e217e1c3e06ebb6abfb2578d58f15828555f6cd08cee1692f3be94e8aa5af"
+    },
+    {
+      "file": "move_3.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/3210800/render/move/3",
+      "sha256": "c75da93360c7ffc8544cbd897b9a418dd80251ac7a3e4b1633c0c95a95e8f482"
+    }
+  ]
+}

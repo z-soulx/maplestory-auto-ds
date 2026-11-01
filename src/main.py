@@ -47,10 +47,18 @@ def main():
                         help="Path to a test screenshot for offline debugging")
     parser.add_argument("--cfg", type=str, default="custom",
                         help="Custom config suffix")
+    parser.add_argument("--window_title", type=str, default="",
+                        help="Override game window title substring")
+    parser.add_argument("--stop_file", type=str, default="",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     parser.add_argument("--disable_viz", action="store_true",
                         help="Disable the debug visualization window")
+    parser.add_argument("--record", action="store_true",
+                        help="Record detection frames and attack outputs for offline replay")
+    parser.add_argument("--record_dir", default="",
+                        help="Recording output directory (default: recordings)")
     args = parser.parse_args()
 
     if args.debug:
@@ -89,11 +97,34 @@ def main():
         cfg["disable_viz"] = True
         logger.info("  Debug visualization: disabled")
 
+    if args.window_title:
+        cfg["game_window"]["title"] = args.window_title
+        cfg["game_window"]["exact_match"] = False
+
+    if args.record:
+        cfg.setdefault("recording", {})["enable"] = True
+    if args.record_dir:
+        cfg.setdefault("recording", {})["directory"] = args.record_dir
+    # Snapshot the effective identity policy, including compatibility migration.
+    from src.utils.player_identity import migrate_legacy_identity
+    if migrate_legacy_identity(cfg):
+        logger.info("[Config] 旧版定位设置已兼容为互补模式；名字被挡时可使用已勾选的勋章或外观。")
+    from src.utils.session_recorder import SessionRecorder
+    recorder = SessionRecorder.from_config(cfg)
+    try:
+        run_detector(cfg, args, recorder)
+    finally:
+        if recorder:
+            recorder.close()
+
+
+def run_detector(cfg, args, recorder=None):
+
     # -------------------------------------------------------------------
     # Initialize the monster detector
     # -------------------------------------------------------------------
     logger.info("Initializing MonsterDetector...")
-    detector = MonsterDetector(cfg, test_image=args.test_image)
+    detector = MonsterDetector(cfg, test_image=args.test_image, recorder=recorder)
 
     logger.info("Loading monster templates...")
     if not detector.load_monster_images():
@@ -108,7 +139,7 @@ def main():
     # Create keyboard controller for movement + listener for F1 toggle
     from src.input.KeyBoardController import KeyBoardController
     from src.input.KeyBoardListener import KeyBoardListener
-    kb = KeyBoardController(cfg)
+    kb = KeyBoardController(cfg, recorder=recorder)
     detector._kb = kb  # Wire to detector
     kb_listener = KeyBoardListener(cfg, is_autobot=True)
     kb_listener.register_func_key_handler('f1', kb.toggle)
@@ -174,7 +205,8 @@ def main():
     last_frame_seq = -1
     t_last_display = time.time()
 
-    cv2.namedWindow(win_name)
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win_name, 960, 540)
 
     def _on_mouse(event, x, y, flags, param):
         if detector._minimap_select_mode:
@@ -189,6 +221,9 @@ def main():
 
     try:
         while not detector.is_terminated:
+            if args.stop_file and os.path.exists(args.stop_file):
+                detector.is_terminated = True
+                break
             # Show debug image — only when a new frame is ready
             # (exact same pattern as reference: MapleStoryAutoLevelUp.py:1851-1864)
             if detector.frame_seq != last_frame_seq:
@@ -210,8 +245,8 @@ def main():
                             if rect:
                                 _, _, win_w, win_h = rect
                                 cv2.moveWindow(win_name,
-                                               screen_w - win_w - 20,
-                                               screen_h - win_h - 100)
+                                               max(0, screen_w - win_w - 20),
+                                               max(0, screen_h - win_h - 100))
                                 window_positioned = True
                         except Exception:
                             pass

@@ -1,0 +1,57 @@
+{
+  "name_cn": "黑鳄鱼",
+  "name": "Croco",
+  "id": 5130103,
+  "region": "GMS",
+  "version": "83",
+  "wiki": "https://maplestory.wiki/GMS/83/mob/5130103",
+  "api": "https://maplestory.io/api/GMS/83/mob/5130103",
+  "framebooks": {
+    "die1": 2,
+    "hit1": 1,
+    "move": 4,
+    "stand": 3
+  },
+  "frames": [
+    {
+      "file": "stand_0.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/5130103/render/stand/0",
+      "sha256": "d853986e2fc9b1cc9f6c65b24bf6d31009e5b81685894e112172d2c4c591ad84"
+    },
+    {
+      "file": "stand_1.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/5130103/render/stand/1",
+      "sha256": "f58a4339b0a748c073862e4906d229495194584a95bdfb887b4869267094f058"
+    },
+    {
+      "file": "stand_2.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/5130103/render/stand/2",
+      "sha256": "085ae9d0471059f039442fa8880c655f5c799bc9fe18700ed838d0dfa966e8b4"
+    },
+    {
+      "file": "move_0.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/5130103/render/move/0",
+      "sha256": "afe3231f0eff45e333df9c723ca73df989d6c4bea81bc1275fd1c1f684a807e1"
+    },
+    {
+      "file": "move_1.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/5130103/render/move/1",
+      "sha256": "4e8dbba98cdb0aa49410071984a901a8b7911f9cb1d5859d624414e72c7fd3c2"
+    },
+    {
+      "file": "move_2.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/5130103/render/move/2",
+      "sha256": "f334c88b1ae047f27c17c0d3c91a2588d0b311871653e1e92cd2664a9571d0b1"
+    },
+    {
+      "file": "move_3.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/5130103/render/move/3",
+      "sha256": "5c6828ca1c3f50d10366dce9a66e205000735a80b8a9c82955f3cd7e4472b02a"
+    },
+    {
+      "file": "hit1_0.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/5130103/render/hit1/0",
+      "sha256": "121a9ffd860b475ac339d7ab7b2972f844a5208d39f79b8b20ac72db749b5589"
+    }
+  ]
+}

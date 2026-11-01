@@ -1,0 +1,57 @@
+{
+  "name_cn": "刺蘑菇",
+  "name": "Horny Mushroom",
+  "id": 2110200,
+  "region": "GMS",
+  "version": "83",
+  "wiki": "https://maplestory.wiki/GMS/83/mob/2110200",
+  "api": "https://maplestory.io/api/GMS/83/mob/2110200",
+  "framebooks": {
+    "die1": 4,
+    "hit1": 1,
+    "move": 4,
+    "stand": 3
+  },
+  "frames": [
+    {
+      "file": "stand_0.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/2110200/render/stand/0",
+      "sha256": "7f51f58466cfd5d0bf9f133722ede38372860f2106d6c3130308ea977f862617"
+    },
+    {
+      "file": "stand_1.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/2110200/render/stand/1",
+      "sha256": "2671c226dfb29388fc724adac5c43d52785c91273997fe08ae370908df1d93c0"
+    },
+    {
+      "file": "stand_2.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/2110200/render/stand/2",
+      "sha256": "8889220a467185f2deff894b33ea6c414f6b689f00a3976fde796a8649f70541"
+    },
+    {
+      "file": "move_0.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/2110200/render/move/0",
+      "sha256": "001862fe11b0a68937d8a895905deb32b1e5c82d6cc296d39aefa478ccbfb2f0"
+    },
+    {
+      "file": "move_1.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/2110200/render/move/1",
+      "sha256": "95793322f751f95f288ca50e1e718f76f0c7208ea6bfdf7e1fc1d80f04a9ff8d"
+    },
+    {
+      "file": "move_2.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/2110200/render/move/2",
+      "sha256": "246d2c6e57b8d14f7f59dc6698cee39126e1a650dcce9457b5b0abbc4dabcd19"
+    },
+    {
+      "file": "move_3.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/2110200/render/move/3",
+      "sha256": "3be9b76752b7531278fcc6e73de3ef552f417a8c55681cf65f2fce31c0ec51fa"
+    },
+    {
+      "file": "hit1_0.png",
+      "url": "https://maplestory.io/api/GMS/83/mob/2110200/render/hit1/0",
+      "sha256": "472d3b791c0c8a0eaa23a2ae7c52532afc4ca8e1b0cfc70a8d08805c9bf6aa34"
+    }
+  ]
+}

@@ -1,5 +1,7 @@
 # 前言
 
+> 双击 `start_feng_du_yan_shou.cmd` 先配置按键和模式，再点击启动。重启后操作流程与风独眼兽识别配置见 [中文使用准备说明](GETTING_STARTED_CN.md)。
+
 > [English](./README_EN.md)
 
 * 本项目参考了这个库 [MapleStoryAutoLevelUp](https://github.com/KenYu910645/MapleStoryAutoLevelUp)
@@ -12,6 +14,7 @@
 - [x] 地图圈选 + 地图绘制（路线录制）
 - [x] hp_mp自动识别回复
 - [x] 自动打怪（走路、攻击、技能）
+- [x] 检测画面与攻击指令录制、本地逐帧回放（启动设置中勾选，详见中文使用说明）
 - [x] 告警（测谎报警）
 - [ ] 客户端化
 
@@ -80,6 +83,9 @@ monster/
 
 - 素材下载地址：[https://maplestory.wiki/GMS/83/mob/1110101](https://maplestory.wiki/GMS/83/mob/1110101)
 - 把怪物「走动/站立」的图片放进对应文件夹即可。
+- 已补充猴子（Lupin，3210800）与无魂猴子／僵尸猴子（Zombie Lupin，4230101）素材。双击启动后，在“识别与补药”页勾选目标怪物；也可使用 `--cfg monkeys` 运行猴子专用检测配置。初始缩放 1.4、阈值 0.28，需先在目标地图确认识别。下载与自检见 [中文使用说明](GETTING_STARTED_CN.md#已导入的怪物)。
+- 已补充刺蘑菇（Horny Mushroom，2110200）站立、移动和受击素材，可在“识别与补药”页勾选，或使用 `--cfg horny_mushroom` 运行专用检测配置。初始缩放 1.4、阈值 0.28，需先在目标地图检测确认。
+- 已补充黑鳄鱼（Croco，5130103）的 8 张站立／移动／受击素材，启动器中可勾选“黑鳄鱼”，专用检测配置为 `--cfg croco`。初始缩放 1.4、阈值 0.28，需先在目标地图确认识别。
 
 ## 配置说明（`config/config_custom.yaml`）
 

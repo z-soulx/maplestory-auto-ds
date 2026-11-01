@@ -10,6 +10,7 @@ import pyautogui
 from pynput.keyboard import Key, Controller as KBController
 
 from src.utils.logger import logger
+from src.utils.latency import milliseconds
 
 pyautogui.FAILSAFE = False
 _pynput_kb = KBController()
@@ -86,10 +87,17 @@ class KeyBoardController:
         kb.set_command("none none none")   # stop
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, recorder=None):
         self.cfg = cfg
+        self.recorder = recorder
+        self._decision_id = None
+        self._timing_origin = {}
+        self._send_timing = threading.local()
+        self._last_record_wait = None
+        self._last_record_input = None
         self.is_enable = True
         self.is_terminated = False
+        self._had_focus = True
 
         # Key bindings
         key_cfg = cfg.get("key", {})
@@ -119,6 +127,7 @@ class KeyBoardController:
         self._buff_ready_time = time.time() + startup_delay  # 首次 buff 允许时间（启动延迟）
         self._action_lock = threading.Lock()
         self._send_lock = threading.Lock()
+        self._command_lock = threading.RLock()
         self._pending_hp_potion = False
         self._pending_mp_potion = False
 
@@ -144,13 +153,48 @@ class KeyBoardController:
         self._thread.start()
         logger.info("[KeyBoardController] Started")
 
-    def set_command(self, cmd_str):
+    def set_command(self, cmd_str, *, decision_id=None, timing_origin=None):
         """Set movement command from string like 'left none jump'."""
         parts = cmd_str.strip().split()
         if len(parts) >= 3:
-            self.cmd_left_right = parts[0]
-            self.cmd_up_down = parts[1]
-            self.cmd_action = parts[2]
+            requested = time.perf_counter()
+            with self._command_lock:
+                self.cmd_left_right, self.cmd_up_down, self.cmd_action = parts[:3]
+                self._decision_id = decision_id
+                accepted = time.perf_counter()
+                self._timing_origin = dict(timing_origin or {}, command_accepted_monotonic=accepted)
+                if self.recorder and decision_id is not None:
+                    ready = self._timing_origin.get("decision_ready_monotonic")
+                    self.recorder.event("command_accepted", decision_id=decision_id, command=cmd_str,
+                                        latency_ms={"dispatch_lock_wait_ms": milliseconds(requested, accepted),
+                                                    "decision_to_command_ms": milliseconds(ready, accepted)
+                                                    if ready is not None else None})
+
+    def _command_context(self):
+        with self._command_lock:
+            return {"decision_id": self._decision_id,
+                    "command": f"{self.cmd_left_right} {self.cmd_up_down} {self.cmd_action}",
+                    "action": self.cmd_action, "timing_origin": dict(self._timing_origin)}
+
+    @staticmethod
+    def _output_latency(context, started, finished):
+        origin = context.get("timing_origin", {})
+        result = {"send_ms": milliseconds(started, finished)}
+        for source, metric in (("command_accepted_monotonic", "command_to_send_ms"),
+                               ("decision_ready_monotonic", "decision_to_send_ms"),
+                               ("capture_end_monotonic", "frame_age_at_send_ms"),
+                               ("capture_start_monotonic", "frame_to_send_ms")):
+            stamp = origin.get(source)
+            result[metric] = milliseconds(stamp, started) if stamp is not None else None
+        stamp = origin.get("capture_start_monotonic")
+        result["frame_to_send_complete_ms"] = milliseconds(stamp, finished) if stamp is not None else None
+        return result
+
+    def _record_wait(self, context, reason):
+        state = (context["decision_id"], context["action"], reason)
+        if self.recorder and state != self._last_record_wait:
+            self.recorder.event("attack_wait", **context, reason=reason)
+            self._last_record_wait = state
 
     def _tap_direction(self, key: str, duration=0.04) -> bool:
         """Tap a direction briefly to turn without visibly walking."""
@@ -162,8 +206,9 @@ class KeyBoardController:
         return True
 
     def disable(self):
-        self.is_enable = False
-        self.release_all()
+        with self._command_lock:
+            self.is_enable = False
+            self.release_all()
 
     def enable(self):
         self.is_enable = True
@@ -209,8 +254,28 @@ class KeyBoardController:
 
     def _press_key_serialized(self, key: str, duration=0.05) -> bool:
         """Serialize one-shot key sends across keyboard and health-monitor threads."""
+        # Snapshot before taking the send lock (the keyboard loop holds command lock).
+        context = self._command_context() if self.recorder else None
+        requested = time.perf_counter()
         with self._send_lock:
-            return press_key(key, duration)
+            start_ms = self.recorder.elapsed_ms() if self.recorder else None
+            started = time.perf_counter()
+            sent = press_key(key, duration)
+            finished = time.perf_counter()
+            self._send_timing.value = {"started": started, "finished": finished,
+                                       "send_lock_wait_ms": milliseconds(requested, started)}
+            if self.recorder:
+                self.recorder.event("key_output", **context, key=key, duration=duration,
+                                    start_elapsed_ms=start_ms, result="sent" if sent else "failed",
+                                    latency_ms={"send_lock_wait_ms": milliseconds(requested, started),
+                                                "key_api_ms": milliseconds(started, finished)})
+            return sent
+
+    def _attack_output_timing(self, context, requested, finished):
+        actual = getattr(self._send_timing, "value", None) or {"started": requested, "finished": finished}
+        latency = self._output_latency(context, actual["started"], actual["finished"])
+        latency["send_lock_wait_ms"] = actual.get("send_lock_wait_ms")
+        return latency
 
     def press_hp_potion(self) -> bool:
         """Immediately send the HP potion key and pause attack briefly."""
@@ -231,12 +296,40 @@ class KeyBoardController:
     def _run(self):
         """Daemon loop — applies left/right, up/down, action, pickup, and buff commands."""
         while not self.is_terminated:
-            if self.is_enable:
-                self._apply_movement()
-                self._apply_action()
+            has_focus = self._game_has_focus()
+            if not has_focus and self._had_focus:
+                self.release_all()
+                logger.info("[KB] 游戏失去前台焦点，暂停按键；切回游戏后继续。")
+            elif has_focus and not self._had_focus:
+                logger.info("[KB] 游戏已回到前台。" + ("按键已恢复。" if self.is_enable else "F1 仍处于暂停，需按 F1 恢复。"))
+            self._had_focus = has_focus
+            input_state = "paused" if not self.is_enable else "ready" if has_focus else "background"
+            if getattr(self, "recorder", None) and input_state != self._last_record_input:
+                self.recorder.event("input_state", state=input_state, **self._command_context())
+                self._last_record_input = input_state
+            if self.is_enable and has_focus:
+                # A turn and its attack must consume one complete command.
+                # Stop/target updates wait for this short key send to finish.
+                with self._command_lock:
+                    if self.is_enable and not self.is_terminated:
+                        self._apply_movement()
+                        self._apply_action()
                 self._apply_pickup()
                 self._apply_buff()
             self._limit_fps()
+
+    def _game_has_focus(self):
+        if not self.cfg.get("bot", {}).get("require_foreground", False):
+            return True
+        try:
+            import win32gui
+            title = win32gui.GetWindowText(win32gui.GetForegroundWindow())
+            expected = self.cfg["game_window"]["title"]
+            if self.cfg["game_window"].get("exact_match", False):
+                return title.casefold() == expected.casefold()
+            return bool(expected) and expected.casefold() in title.casefold()
+        except Exception:
+            return False
 
     def _apply_buff(self):
         """自动加 buff：仅在 hunt 模式，按各 buff 键的冷却时间按下。"""
@@ -309,12 +402,15 @@ class KeyBoardController:
                 key_up(self._last_left_right)
 
             if lr != self._last_face_dir:
-                tap_duration = float(self.cfg.get("directional_attack", {}).get("face_tap_duration", 0.07))
+                attack_cfg = self.cfg.get("directional_attack", {})
+                tap_duration = max(0.03, float(attack_cfg.get("face_tap_duration", 0.05)))
                 key = "left" if lr == "face_left" else "right"
-                if self._tap_direction(key, duration=max(0.03, tap_duration)):
+                if self._tap_direction(key, duration=tap_duration):
                     self._last_face_dir = lr
-                    # 转身后多停一会儿再攻击，确保转身（可能被攻击动画吞掉）先完成。
-                    self._face_direction_until = time.time() + tap_duration + 0.3
+                    # The direction tap has already finished. Wait only for the
+                    # game to settle, rather than counting the tap twice.
+                    settle = max(0.0, float(attack_cfg.get("turn_settle_seconds", 0.08)))
+                    self._face_direction_until = time.time() + settle
                     if time.time() - getattr(self, '_last_face_log', 0) >= 2.0:
                         logger.info(f"[KB] 转身 {lr} → 按 {key} 键 ({tap_duration:.2f}s)")
                         self._last_face_log = time.time()
@@ -350,8 +446,10 @@ class KeyBoardController:
 
     def _apply_action(self):
         """Apply one-shot actions only once per command change."""
+        context = self._command_context()
         # Force heal overrides normal action
         if self.is_need_force_heal:
+            self._record_wait(context, "force_heal")
             self.press_hp_potion()
             return
 
@@ -367,19 +465,24 @@ class KeyBoardController:
                 self._pending_mp_potion = False
 
         if pending_hp:
+            self._record_wait(context, "hp_potion")
             self.press_hp_potion()
             return
         if pending_mp:
+            self._record_wait(context, "mp_potion")
             self.press_mp_potion()
             return
 
         # Attack is level-triggered: keep firing on cooldown while command stays "attack"/"aoe".
-        if self.cmd_action in ("attack", "aoe"):
+        action = context["action"]
+        if action in ("attack", "aoe"):
             if time.time() < self._attack_pause_until:
+                self._record_wait(context, "potion_or_buff_pause")
                 return
             if time.time() < self._face_direction_until:
+                self._record_wait(context, "turn_wait")
                 return
-            if self.cmd_action == "aoe":
+            if action == "aoe":
                 # Explicit AoE action (monster count >= threshold)
                 atk_key = self.key_aoe_skill
                 atk_cd = self.cfg.get("aoe_skill", {}).get("cooldown", 1.0)
@@ -392,8 +495,27 @@ class KeyBoardController:
 
             t_now = time.time()
             if t_now - self._t_last_attack >= float(atk_cd):
-                self._press_key_serialized(atk_key, 0.05)
+                start_ms = self.recorder.elapsed_ms() if self.recorder else None
+                send_started = time.perf_counter()
+                self._send_timing.value = None
+                sent = self._press_key_serialized(atk_key, 0.05)
+                send_finished = time.perf_counter()
+                output_latency = self._attack_output_timing(context, send_started, send_finished)
+                logger.info(f"[KB] attack key={atk_key} action={action} result={'sent' if sent else 'failed'} "
+                            f"send_ms={output_latency['send_ms']} "
+                            f"command_wait_ms={output_latency['command_to_send_ms']} "
+                            f"frame_to_send_ms={output_latency['frame_to_send_ms']}")
+                if self.recorder:
+                    actual = getattr(self._send_timing, "value", None)
+                    actual_start_ms = start_ms + (milliseconds(send_started, actual["started"]) if actual else 0)
+                    self.recorder.event("attack_output", **context, key=atk_key,
+                                        request_elapsed_ms=start_ms, start_elapsed_ms=actual_start_ms,
+                                        result="sent" if sent else "failed",
+                                        latency_ms=output_latency)
+                self._last_record_wait = None
                 self._t_last_attack = t_now
+                if not sent:
+                    return
                 # 连续攻击达到阈值后，短暂朝怪物方向移动一下（重新面向/贴近）。
                 self._attack_count += 1
                 interval = int(self.cfg.get("directional_attack", {}).get("attack_move_interval", 3))
@@ -401,6 +523,8 @@ class KeyBoardController:
                     move_seconds = float(self.cfg.get("directional_attack", {}).get("attack_move_seconds", 0.3))
                     self._force_walk_until = time.time() + move_seconds
                     self._attack_count = 0
+            else:
+                self._record_wait(context, "cooldown")
             return
 
         if self.cmd_action != self._last_action:
@@ -416,7 +540,14 @@ class KeyBoardController:
                 self._press_key_serialized(self.key_teleport)
             elif self.cmd_action == "attack_once":
                 # One-shot single attack (ignores cooldown), then reset.
-                self._press_key_serialized(self.key_directional_attack, 0.05)
+                send_started = time.perf_counter()
+                self._send_timing.value = None
+                sent = self._press_key_serialized(self.key_directional_attack, 0.05)
+                send_finished = time.perf_counter()
+                if self.recorder:
+                    self.recorder.event("attack_output", **context, key=self.key_directional_attack,
+                                        result="sent" if sent else "failed",
+                                        latency_ms=self._attack_output_timing(context, send_started, send_finished))
                 self.cmd_action = "none"
             elif self.cmd_action == "add_hp":
                 self.press_hp_potion()

@@ -124,7 +124,6 @@ directional_attack:
   attack_move_interval: 3          # 连续攻击多少次后，朝怪物方向移动一下
   attack_move_seconds: 0.3         # 移动时长（秒）
   aoe_monster_count: 3             # 识别怪物>=此数量时使用群攻
-  in_place_aoe_idle_seconds: 3.0   # 原地攻击时，多少秒没怪就放一次群攻(爆炸箭)
   in_place_walk_interval_seconds: 30    # 原地攻击时每隔多少秒走动一次
   in_place_walk_seconds: 0.30           # 向右走多少秒
   in_place_walk_back_seconds: 0.32      # 向左走多少秒

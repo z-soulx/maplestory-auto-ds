@@ -1,0 +1,77 @@
+# 风独眼兽 / Curse Eye，GMS 83 mob 3230100。
+# 此配置只与 config_default.yaml 合并，不继承 config_custom.yaml。
+bot:
+  mode: "detect"
+  attack: "directional"
+  map: ""
+  enable_route: false
+  warning: true
+
+game_window:
+  title: "冒险岛怀旧服"
+  exact_match: true
+  title_bar_height: 0
+
+# 可选的勋章辅助模板，默认关闭；名字定位不依赖此模板。
+title:
+  enable: false
+  template: "character/player_title_current.png"
+  mode: "grayscale"
+  match_threshold: 0.04
+  candidate_threshold: 0.05
+  manual_track_threshold: 0.06
+  offset: [-5, -89]
+  center_accept_radius: 1800
+  max_jump_px: 900
+appearance:
+  enable: false
+
+# 默认只用名字；勋章和外观核对可在界面独立勾选。
+player_identity:
+  enable: true
+  name: "zcherly"
+  require_medal: false
+  require_appearance: false
+  allow_partial_name: true
+  medal_threshold: 0.06
+  alignment_tolerance: 8
+  templates:
+    - template: "character/player_name_zcherly.png"
+      offset: [-6, -29]
+      diff_thres: 0.04
+    - template: "character/player_name_zcherly_right.png"
+      partial: true
+      offset: [-22, -29]
+      diff_thres: 0.07
+
+monster_detect:
+  mode: "color"
+  monsters:
+    feng_du_yan_shou:
+      diff_thres: 0.28
+      scales: [1.4]
+      min_color_spread: 30
+  diff_thres: 0.28
+  scales: [1.4]
+  search_box_margin: 20
+  display_scale: 0.65
+  detection_interval: 2
+  with_enemy_hp_bar: false
+
+# 识别观察范围；实际技能距离通过 attack_range_x/attack_range_y 独立设置。
+directional_attack:
+  range_x: 650
+  range_y: 90
+
+health_monitor:
+  enable: false
+pickup:
+  enable: false
+buff_skill:
+  keys: []
+  cooldown: []
+minimap:
+  width_boundary_pct: 0
+system:
+  fps_limit_main: 10
+  fps_limit_window_capturor: 15
